@@ -1,0 +1,146 @@
+# =============================================================================
+# Cask Auto-Bump for ZSearch
+# =============================================================================
+#
+# Watches the Azure Blob release feed (`latest-mac.yml`) and, when a newer
+# version appears than the one pinned in Casks/zsearch.rb, opens a PR that
+# bumps the cask's `version` and `sha256` to the new release.
+#
+# Runs hourly + on manual dispatch. Idempotent — if the cask already matches
+# the latest feed, the job ends silently.
+# =============================================================================
+
+name: Auto-bump zsearch cask
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly at :17 to spread load off the hour
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v4
+
+      - name: Resolve latest release from Azure Blob
+        id: feed
+        run: |
+          set -euo pipefail
+          FEED_URL="https://stdocumindprodaue.blob.core.windows.net/desktop-updates/latest-mac.yml"
+
+          # electron-builder writes:
+          #   version: 2.10.3
+          #   files:
+          #     - url: ZSearch-2.10.3-arm64.dmg
+          #       sha512: ...
+          #       size: ...
+          # We need: version + DMG download URL + SHA256 (recomputed locally —
+          # the feed publishes SHA512; cask requires SHA256).
+          FEED_BODY="$(curl -fsSL "$FEED_URL")"
+          NEW_VERSION="$(printf '%s\n' "$FEED_BODY" | awk '/^version:/{print $2; exit}')"
+
+          if [[ -z "$NEW_VERSION" ]]; then
+            echo "Could not parse version from feed:"
+            echo "$FEED_BODY"
+            exit 1
+          fi
+
+          CURRENT_VERSION="$(grep -E '^\s*version "' Casks/zsearch.rb | head -1 | sed -E 's/.*version "([^"]+)".*/\1/')"
+
+          echo "current=$CURRENT_VERSION"
+          echo "latest=$NEW_VERSION"
+
+          echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "new_version=$NEW_VERSION"         >> "$GITHUB_OUTPUT"
+
+          if [[ "$CURRENT_VERSION" == "$NEW_VERSION" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already up to date."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download DMG and compute SHA256
+        if: steps.feed.outputs.skip == 'false'
+        id: hash
+        run: |
+          set -euo pipefail
+          NEW_VERSION="${{ steps.feed.outputs.new_version }}"
+          DMG_URL="https://stdocumindprodaue.blob.core.windows.net/desktop-updates/ZSearch-${NEW_VERSION}-arm64.dmg"
+
+          echo "Downloading $DMG_URL"
+          curl -fsSL --retry 3 --retry-delay 5 "$DMG_URL" -o /tmp/zsearch.dmg
+
+          SHA256="$(sha256sum /tmp/zsearch.dmg | awk '{print $1}')"
+          SIZE_MB="$(( $(stat -c%s /tmp/zsearch.dmg) / 1024 / 1024 ))"
+
+          echo "sha256=$SHA256"
+          echo "size_mb=$SIZE_MB"
+
+          echo "sha256=$SHA256"   >> "$GITHUB_OUTPUT"
+          echo "size_mb=$SIZE_MB" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite Casks/zsearch.rb
+        if: steps.feed.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          NEW_VERSION="${{ steps.feed.outputs.new_version }}"
+          NEW_SHA256="${{ steps.hash.outputs.sha256 }}"
+
+          # Replace only the version + sha256 lines; everything else stays.
+          # Anchor on `version "..."` and `sha256 "..."` at the top of the cask block.
+          sed -i -E \
+            -e "s/^(\s*version \")[^\"]+(\")/\1${NEW_VERSION}\2/" \
+            -e "s/^(\s*sha256 \")[a-f0-9]+(\")/\1${NEW_SHA256}\2/" \
+            Casks/zsearch.rb
+
+          echo "--- diff ---"
+          git diff Casks/zsearch.rb
+
+      - name: Open PR
+        if: steps.feed.outputs.skip == 'false'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: autobump/zsearch-${{ steps.feed.outputs.new_version }}
+          base: main
+          title: "chore: bump zsearch to ${{ steps.feed.outputs.new_version }}"
+          commit-message: |
+            chore: bump zsearch to ${{ steps.feed.outputs.new_version }}
+
+            Detected by autobump workflow from
+            https://stdocumindprodaue.blob.core.windows.net/desktop-updates/latest-mac.yml
+
+            - version: ${{ steps.feed.outputs.current_version }} → ${{ steps.feed.outputs.new_version }}
+            - sha256: recomputed from
+              ZSearch-${{ steps.feed.outputs.new_version }}-arm64.dmg
+              (${{ steps.hash.outputs.size_mb }} MB)
+          body: |
+            Autobump from the desktop release feed.
+
+            **Old version**: `${{ steps.feed.outputs.current_version }}`
+            **New version**: `${{ steps.feed.outputs.new_version }}`
+            **DMG size**: ${{ steps.hash.outputs.size_mb }} MB
+            **SHA256**: `${{ steps.hash.outputs.sha256 }}`
+
+            Verify by running locally:
+
+            ```sh
+            brew untap zsearch-ai/zsearch || true
+            brew tap zsearch-ai/zsearch
+            brew audit --cask --new zsearch-ai/zsearch/zsearch
+            brew style --cask zsearch-ai/zsearch/zsearch
+            ```
+
+            Merge when audit + style are clean.
+          delete-branch: true
+          labels: |
+            autobump
+            cask
