@@ -1,6 +1,6 @@
 cask "zsearch" do
-  version "2.18.0"
-  sha256 "f400ba12682bdb7025e8de69d1b0f5536f9ff8333487df0cad59b65328d422c8"
+  version "2.19.0"
+  sha256 "ae9d122409f4ec40d047335c558f5e9cb4f34f5854a2536c321709c9187f381d"
 
   url "https://stdocumindprodaue.blob.core.windows.net/desktop-updates/ZSearch-#{version}-arm64.dmg",
       verified: "stdocumindprodaue.blob.core.windows.net/desktop-updates/"
